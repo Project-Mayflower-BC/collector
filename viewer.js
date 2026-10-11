@@ -9,7 +9,10 @@ let page = 0;
 let selectedSequence;
 let cache = new Map();
 const inspect = event => {
-  if (!cache.has(event.sequence)) cache.set(event.sequence, decodePayload(event.payload, event));
+  if (!cache.has(event.sequence)) {
+    const decoded = decodePayload(event.payload, event);
+    cache.set(event.sequence, !event.payload && event.detail ? { ...decoded, detail: event.detail } : decoded);
+  }
   return cache.get(event.sequence);
 };
 const json = value => JSON.stringify(value, (_key, item) =>
@@ -60,9 +63,11 @@ async function loadRecording() {
       Object.entries(counts).map(([source, count]) => `${count} ${source}`).join(" · ");
     const problems = recording.events.filter(event => ["gap", "pause", "resume"].includes(event.kind) || event.captureError || event.payload?.encoding === "omitted");
     const dropped = (recording.session.bridgeDropped || 0) + (recording.session.captureDropped || 0);
-    if (problems.length || dropped) {
+    if (problems.length || dropped || recording.session.interrupted) {
       $("#warning").hidden = false;
-      $("#warning").textContent = `${problems.length} capture warning(s); ${dropped} events dropped. Inspect the trace before reconstructing a game.`;
+      $("#warning").textContent = `${problems.length} capture warning(s); ${dropped} events dropped. ` +
+        (recording.session.interrupted ? `Recording interrupted: ${recording.session.endReason}. ` : "") +
+        "Inspect the trace before reconstructing a game.";
     }
   } else $("#summary").textContent = "No recorded sessions yet. Start before joining a game to capture the initial state.";
   filterEvents();
@@ -71,7 +76,7 @@ async function loadRecording() {
 function filterEvents() {
   const query = $("#search").value.toLowerCase().trim();
   filtered = (recording?.events || []).filter(event => !query ||
-    `${event.sequence} ${event.transport} ${event.kind} ${event.direction || ""} ${event.url || ""} ${json(inspect(event))}`.toLowerCase().includes(query));
+    `${event.sequence} ${event.transport} ${event.kind} ${event.direction || ""} ${event.url || ""} ${event.detail || ""} ${event.captureError || ""} ${json(inspect(event))}`.toLowerCase().includes(query));
   page = Math.min(page, Math.max(0, Math.ceil(filtered.length / PAGE_SIZE) - 1));
   renderEvents();
 }

@@ -27,12 +27,12 @@ export class NetworkCapture {
     this.requests.clear();
     this.diagnostic(enabled ? "resume" : "pause", "Capture setting changed; this trace may have gaps.");
   }
-  close(reason) {
+  close(reason, fields = {}) {
     if (this.closed) return;
     this.closed = true;
     this.requests.clear();
     this.sockets.clear();
-    this.writer.metadata.endedAt = new Date().toISOString();
+    Object.assign(this.writer.metadata, fields, { endedAt: new Date().toISOString(), endReason: reason });
     this.diagnostic("stop", reason);
   }
   track(map, key, value) {
@@ -47,6 +47,7 @@ export class NetworkCapture {
     if (method === "Page.frameNavigated" && !p.frame.parentId) {
       if (!isColonistUrl(p.frame.url, ["https:"])) { this.leave("Navigated outside Colonist."); return; }
       this.mainFrameId = p.frame.id;
+      Object.assign(this.writer.metadata, { documentLoaderId: p.frame.loaderId, frameId: p.frame.id });
       this.epoch++;
       this.requests.clear();
       this.sockets.clear();

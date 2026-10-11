@@ -44,12 +44,15 @@ const errors = [];
 const delay = () => new Promise(resolve => setTimeout(resolve, 100));
 async function until(read, predicate, label) {
   let value;
-  for (let attempt = 0; attempt < 100; attempt++) {
+  for (let attempt = 0; attempt < 300; attempt++) {
     value = await read();
     if (predicate(value)) return value;
     await delay();
   }
-  assert.fail(`Timed out: ${label}: ${JSON.stringify(value)}`);
+  const summary = value?.events ? { session: value.session, events: value.events.length,
+    incomingBurst: value.events.filter(event => event.direction === "incoming" && event.payload?.data.startsWith('{"burst":')).length,
+    lastSequence: value.events.at(-1)?.sequence } : value;
+  assert.fail(`Timed out: ${label}: ${JSON.stringify(summary)}`);
 }
 try {
   context = await chromium.launchPersistentContext(profile, {
@@ -78,13 +81,14 @@ try {
     addEventListener("message", event => { if (event.data?.source === "colonist-session-collector/v1") collectorBusEvents++; });
     return Object.values(beforeCollector).map(value => Function.prototype.toString.call(value));
   });
-  const viewer = await context.newPage();
+  let viewer = await context.newPage();
   await viewer.goto(`chrome-extension://${extensionId}/viewer.html`);
   console.log("Fixture and extension viewer loaded");
   const send = message => viewer.evaluate(message => chrome.runtime.sendMessage(message), message);
   const targets = await viewer.evaluate(() => chrome.debugger.getTargets());
   const tabId = targets.find(item => item.url === `https://colonist.io:${port}/fixture`).tabId;
-  assert.equal((await send({ type: "recorder-start", tabId })).ok, true);
+  const initialStart = await send({ type: "recorder-start", tabId });
+  assert.equal(initialStart.ok, true, JSON.stringify(initialStart));
   console.log("Chrome debugger attached");
   assert.equal((await send({ type: "recorder-start", tabId })).ok, false, "duplicate start rejected");
   const read = () => viewer.evaluate(async () => {
@@ -137,6 +141,26 @@ try {
     beforeCollector.fetch === fetch && beforeCollector.open === XMLHttpRequest.prototype.open && beforeCollector.xhrSend === XMLHttpRequest.prototype.send), true, "native functions unchanged");
   assert.equal(await page.evaluate(() => collectorBusEvents), 0, "no collector window message bridge");
   assert.equal(await page.evaluate(() => Boolean(window[Symbol.for("colonist-session-collector.installed")])), false, "no page hook marker");
+  const checkpoint = await viewer.evaluate(async id => (await import("./db.js")).readCheckpoint(id), recording.session.id);
+  assert.ok(checkpoint.sequence >= Math.max(...recording.events.map(event => event.sequence)));
+  assert.equal(checkpoint.sockets.length, 1, "recovery checkpoint retains the live Colonist socket only");
+  // Close the extension UI and exceed the normal 30-second worker idle threshold.
+  // The health timer runs only while this explicit recording is attached.
+  const idleMs = Number(process.env.COLLECTOR_IDLE_MS || 65000);
+  console.log(`Testing ${idleMs} ms with extension UI closed`);
+  await viewer.close();
+  await new Promise(resolve => setTimeout(resolve, idleMs));
+  const reopened = await context.newPage();
+  await reopened.goto(`chrome-extension://${extensionId}/viewer.html`);
+  // Keep the helpers pointing to the same page object by opening a replacement
+  // viewer below rather than touching the fixture tab or recreating its socket.
+  viewer = reopened;
+  assert.equal((await state()).activeTabId, tabId, "recording survives idle with popup/viewer closed");
+  assert.equal((await state()).sessionId, recording.session.id);
+  assert.equal(await viewer.evaluate(() => chrome.action.getBadgeText({})), "REC");
+  await page.evaluate(() => fixtureSocket.send("after-idle"));
+  await until(read, value => value.events.some(event => event.payload?.data === "after-idle"), "post-idle message captured");
+  console.log("Closed-UI idle check passed");
   await viewer.locator("#refresh").click();
   await viewer.locator("#export").click();
   await until(() => viewer.locator("#error").textContent(), value => value.includes("Stop recording"), "active export guard");
@@ -152,6 +176,7 @@ try {
   await delay();
   await viewer.evaluate(() => chrome.storage.local.set({ recordingEnabled: true }));
   await until(state, value => value.enabled, "resumed state");
+  await page.bringToFront();
   await page.evaluate(() => {
     fixtureSocket.send("record-after-resume");
     for (let i = 0; i < 120; i++) fixtureSocket.send(JSON.stringify({ burst: i }));
@@ -184,7 +209,7 @@ try {
   await viewer.locator("#export").click();
   const download = await downloadPromise;
   const saved = JSON.parse(await fs.readFile(await download.path(), "utf8"));
-  assert.equal(saved.extensionVersion, "0.2.0");
+  assert.equal(saved.extensionVersion, "0.2.1");
   assert.equal(saved.events.length, count);
   assert.ok(saved.events.some(event => event.decoded?.format === "msgpack" && event.decoded.value.type === 91));
   assert.ok(saved.events.every((event, i) => !i || event.sequence > saved.events[i - 1].sequence));
@@ -199,6 +224,11 @@ try {
   await second.close();
   await until(state, value => value.activeTabId === null && !value.queued, "closed target detach");
   assert.ok((await read()).events.some(event => event.kind === "gap"), "unexpected detach marked as gap");
+  assert.equal(await viewer.evaluate(() => chrome.action.getBadgeText({})), "ERR");
+  const ended = await read();
+  assert.equal(ended.session.stopCode, "debugger_detached");
+  assert.ok(ended.session.detachReason);
+  assert.equal((await viewer.evaluate(() => chrome.storage.local.get("recorderNotice"))).recorderNotice.unexpected, true);
   await viewer.locator("#refresh").click();
   await viewer.screenshot({ path: path.join(root, "tmp", "debugger-recordings-smoke.png"), fullPage: true });
   assert.deepEqual(errors, []);

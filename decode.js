@@ -169,7 +169,7 @@ export function decodePayload(payload, event = {}) {
 export function makeExport(recording) {
   return {
     schema: "colonist-session-collector/v1",
-    extensionVersion: "0.2.0",
+    extensionVersion: "0.2.1",
     exportedAt: new Date().toISOString(),
     session: recording.session,
     events: [...recording.events].sort((a, b) => a.sequence - b.sequence).map(event =>

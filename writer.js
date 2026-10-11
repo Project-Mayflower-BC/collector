@@ -1,8 +1,8 @@
 // A bounded, idempotent queue. Pending includes writes not yet acknowledged by IDB.
 export class EventWriter {
   constructor(metadata, save, { maxEvents = 2000, maxBytes = 32 * 1024 * 1024,
-    schedule = setTimeout, changed = () => {} } = {}) {
-    this.metadata = { ...metadata, captureDropped: 0 };
+    schedule = (callback, ms) => setTimeout(callback, ms), changed = () => {} } = {}) {
+    this.metadata = { ...metadata, captureDropped: metadata.captureDropped || 0 };
     Object.assign(this, { save, maxEvents, maxBytes, schedule, changed });
     this.sequence = 0;
     this.queue = [];
@@ -15,7 +15,15 @@ export class EventWriter {
     this.retryMs = 250;
   }
   reserve(fields) {
-    return { ...fields, sequence: ++this.sequence, timestamp: new Date().toISOString() };
+    const timestamp = new Date().toISOString();
+    this.metadata.lastEventAt = timestamp;
+    if (["message", "response"].includes(fields.kind)) this.metadata.lastMessageAt = timestamp;
+    return { ...fields, sequence: ++this.sequence, timestamp };
+  }
+  updateMetadata(fields) {
+    Object.assign(this.metadata, fields);
+    this.dirty = true;
+    void this.pump();
   }
   emit(fields) { this.enqueue(this.reserve(fields)); }
   enqueue(event) {

@@ -34,9 +34,12 @@ async function refresh() {
     $("#stop").disabled = !attached || recorder.busy;
     toggle.checked = recorder.enabled;
     const saved = sessions.find(session => session.id === recorder.sessionId)?.eventCount || 0;
-    $("#status").textContent = (attached ? `${recorder.enabled ? "Recording" : "Paused"}${recorder.activeTabId === selectedTabId ? " this tab" : " another Colonist tab"} · ${saved} saved` : `${sessions.length} saved recording(s)`) +
+    $("#status").textContent = (attached ? `${recorder.enabled ? "Recording" : "Paused"}${recorder.activeTabId === selectedTabId ? " this tab" : " another Colonist tab"} · ${saved} saved` : recorder.interrupted ? "Recording interrupted" : `${sessions.length} saved recording(s)`) +
       ` · ${recorder.queued + recorder.pendingBodies} waiting` + (recorder.dropped ? ` · ${recorder.dropped} dropped` : "") +
-      (recorder.lastError ? ` · Storage error: ${recorder.lastError}` : recorder.notice ? ` · ${recorder.notice}` : "");
+      (recorder.lastError ? ` · Storage error: ${recorder.lastError}` : "");
+    $("#activity").textContent = recorder.lastMessageAt ? `Last payload: ${new Date(recorder.lastMessageAt).toLocaleTimeString()}` : "No payload received in this recording yet.";
+    $("#notice").hidden = !recorder.notice;
+    $("#notice").textContent = recorder.notice ? `${recorder.noticeAt ? new Date(recorder.noticeAt).toLocaleTimeString() + " · " : ""}${recorder.notice}` : "";
   } catch (error) { $("#status").textContent = String(error); }
 }
 await refresh();
