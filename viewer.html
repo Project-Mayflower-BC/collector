@@ -11,7 +11,7 @@
     <header>
       <div><p class="eyebrow">COLONIST COLLECTOR</p><h1>Session recordings</h1>
       <p>Inspect the messages behind your game. Everything is stored locally.</p></div>
-      <label class="toggle"><input id="enabled" type="checkbox"> Recording enabled</label>
+      <label class="toggle"><input id="enabled" type="checkbox"> Capture while attached</label>
     </header>
     <div id="error" class="notice" role="alert" hidden></div>
     <section class="toolbar" aria-label="Recording controls">
@@ -20,7 +20,7 @@
       <button id="export" class="primary" disabled>Export JSON</button>
       <button id="delete" disabled>Delete</button>
     </section>
-    <p id="summary" role="status">Install the extension, then open Colonist to start a recording.</p>
+    <p id="summary" role="status">Start a recording from the extension popup on a Colonist tab.</p>
     <p id="warning" class="notice" hidden></p>
     <section class="workspace">
       <div class="panel">
@@ -36,7 +36,7 @@
         <details><summary>Original event and payload</summary><pre id="raw"></pre></details>
       </div>
     </section>
-    <p class="muted small">One recording per page load. Refresh the list to load new events. Pausing or closing the tab can leave gaps; these are session traces, not yet verified game replays.</p>
+    <p class="muted small">One recording per debugger attachment, including reloads. Refresh the list to load new events. Stop in the popup and wait for zero pending events before exporting. These are session traces, not yet verified game replays.</p>
   </main>
   <script type="module" src="viewer.js"></script>
 </body>

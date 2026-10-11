@@ -10,10 +10,11 @@
   <p class="eyebrow">COLONIST COLLECTOR</p>
   <h1>Your game, recorded.</h1>
   <p>Payloads stay in this browser until you export them.</p>
-  <label class="toggle"><input id="enabled" type="checkbox"> Record Colonist sessions</label>
+  <label class="toggle"><input id="enabled" type="checkbox"> Capture while attached</label>
+  <p><button id="start" class="primary" disabled>Start on this tab</button> <button id="stop" disabled>Stop recording</button></p>
   <p id="status" role="status">Checking recorder…</p>
   <button id="open" class="primary">Open recordings</button>
-  <p class="muted small">Refresh an existing Colonist tab after installing. Start before joining a game for a complete recording.</p>
+  <p class="muted small">Chrome shows a debugging notice while attached. Start, then refresh Colonist before joining a game. Stop recording before exporting.</p>
   <script type="module" src="popup.js"></script>
 </body>
 </html>

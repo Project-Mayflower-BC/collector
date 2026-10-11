@@ -1,191 +1,212 @@
-// No live Colonist traffic: HTTPS requests and WebSocket messages are mocked in Chromium.
+// Real CDP events from loopback TLS/WSS. No live Colonist traffic or signed-in browser.
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import fs from "node:fs/promises";
+import https from "node:https";
+import { execFileSync } from "node:child_process";
 const require = createRequire(import.meta.url);
-const { chromium } = require(process.env.PLAYWRIGHT_MODULE || "playwright");
+const playwrightPath = process.env.PLAYWRIGHT_MODULE || "playwright";
+const { chromium } = require(playwrightPath);
+const dependencyRequire = createRequire(require.resolve(playwrightPath));
+const WebSocket = dependencyRequire("faye-websocket");
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-await fs.mkdir(path.join(root, "tmp"), { recursive: true });
-const profile = await fs.mkdtemp(path.join(root, "tmp", "browser-"));
-const context = await chromium.launchPersistentContext(profile, {
-  channel: "chromium", headless: true, acceptDownloads: true,
-  args: [`--disable-extensions-except=${root}`, `--load-extension=${root}`]
+const certificate = JSON.parse(execFileSync(process.env.TEST_PYTHON || "python", [path.join(root, "tests", "test-certificate.py")], { encoding: "utf8" }));
+const server = https.createServer(certificate, (req, res) => {
+  if (req.url.startsWith("/api/")) {
+    res.writeHead(200, { "content-type": "application/json", "access-control-allow-origin": "*" });
+    res.end('{"fixture":"http","type":4}');
+  } else {
+    res.writeHead(200, { "content-type": "text/html" });
+    res.end("<!doctype html><title>Local collector fixture</title><body>Local collector fixture</body>");
+  }
 });
+const sockets = new Set();
+const connections = new Set();
+server.on("connection", socket => { connections.add(socket); socket.on("close", () => connections.delete(socket)); });
+server.on("upgrade", (req, socket, head) => {
+  if (!WebSocket.isWebSocket(req)) { socket.destroy(); return; }
+  const ws = new WebSocket(req, socket, head);
+  sockets.add(ws);
+  ws.on("close", () => sockets.delete(ws));
+  ws.on("message", event => {
+    ws.send(event.data);
+    if (event.data === "binary-please") ws.send(Buffer.from([0x81, 0xa4, 116, 121, 112, 101, 91]));
+  });
+});
+await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+const port = server.address().port;
+await fs.mkdir(path.join(root, "tmp"), { recursive: true });
+const profile = await fs.mkdtemp(path.join(root, "tmp", "debugger-browser-"));
+let context;
 const errors = [];
-context.on("page", page => page.on("pageerror", error => errors.push(error.message)));
+const delay = () => new Promise(resolve => setTimeout(resolve, 100));
+async function until(read, predicate, label) {
+  let value;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    value = await read();
+    if (predicate(value)) return value;
+    await delay();
+  }
+  assert.fail(`Timed out: ${label}: ${JSON.stringify(value)}`);
+}
 try {
-  await context.route("https://**/*", route => {
+  context = await chromium.launchPersistentContext(profile, {
+    channel: "chromium", headless: true, acceptDownloads: true,
+    args: [`--disable-extensions-except=${root}`, `--load-extension=${root}`, "--no-proxy-server",
+      "--ignore-certificate-errors", "--host-resolver-rules=MAP colonist.io 127.0.0.1, MAP socket.svr.colonist.io 127.0.0.1, MAP colonist.io.example.test 127.0.0.1"]
+  });
+  context.setDefaultTimeout(15000);
+  console.log("Isolated Chromium launched");
+  // Fail closed: only this test server is accessible to page requests.
+  await context.route("**/*", route => {
     const url = new URL(route.request().url());
-    if (url.pathname === "/api/abort-fixture") return new Promise(resolve => setTimeout(resolve, 200)).then(() =>
-      route.fulfill({ contentType: "application/json", body: '{"fixture":"aborted"}' }).catch(() => {}));
-    if (url.pathname.startsWith("/api/")) return route.fulfill({ contentType: "application/json", body: '{"fixture":"http","type":4}' });
-    return route.fulfill({ contentType: "text/html", body: "<!doctype html><title>Collector fixture</title><body>Local test fixture</body>" });
+    if (url.protocol === "chrome-extension:") return route.continue();
+    if (url.protocol === "https:" && url.port === String(port) &&
+      ["colonist.io", "colonist.io.example.test"].includes(url.hostname)) return route.continue();
+    return route.abort();
   });
-  await context.routeWebSocket("wss://**/*", ws => {
-    ws.onMessage(message => {
-      ws.send(message);
-      if (message === "binary-please") ws.send(Buffer.from([0x81, 0xa4, 116, 121, 112, 101, 91]));
-    });
-  });
+  context.on("page", page => page.on("pageerror", error => errors.push(error.message)));
   const worker = context.serviceWorkers()[0] || await context.waitForEvent("serviceworker");
   const extensionId = new URL(worker.url()).host;
   const page = await context.newPage();
-  await page.goto("https://colonist.io/__collector_fixture__");
-  await page.evaluate(async () => {
-    window.fixtureSocket = new WebSocket("wss://socket.svr.colonist.io/?version=2&token=secret-fixture");
-    await new Promise(resolve => fixtureSocket.addEventListener("open", resolve, { once: true }));
-    fixtureSocket.send('{"fixture":"socket","type":130}');
-    fixtureSocket.send("binary-please");
-    fixtureSocket.send(Uint8Array.from([3, 1, 6, ...new TextEncoder().encode("01a234"),
-      0x83, 0xa6, ...new TextEncoder().encode("action"), 15,
-      0xa7, ...new TextEncoder().encode("payload"), 18,
-      0xa8, ...new TextEncoder().encode("sequence"), 5]));
-    const bytes = Uint8Array.of(0, 128, 255);
-    fixtureSocket.send(bytes);
-    bytes.fill(42); // Recording must preserve the bytes at send time.
-    const response = await fetch("/api/collector-fixture");
-    window.fixtureResponse = await response.json();
-    await new Promise(resolve => {
-      const xhr = new XMLHttpRequest();
-      xhr.open("GET", "/api/xhr-fixture");
-      xhr.responseType = "json";
-      xhr.onload = resolve;
-      xhr.send();
-    });
-    // Reusing an aborted XHR must not retain the earlier response listener.
-    await new Promise(resolve => {
-      const xhr = new XMLHttpRequest();
-      xhr.open("GET", "/api/abort-fixture");
-      xhr.send();
-      xhr.abort();
-      xhr.open("GET", "/api/reused-fixture");
-      xhr.onload = resolve;
-      xhr.send();
-    });
-    const external = new WebSocket("wss://example.test/socket");
-    await new Promise(resolve => external.addEventListener("open", resolve, { once: true }));
-    external.send("must-not-record-external");
-    external.close();
+  await page.goto(`https://colonist.io:${port}/fixture`);
+  const originals = await page.evaluate(() => {
+    window.beforeCollector = { WebSocket, send: WebSocket.prototype.send, fetch, open: XMLHttpRequest.prototype.open, xhrSend: XMLHttpRequest.prototype.send };
+    window.collectorBusEvents = 0;
+    addEventListener("message", event => { if (event.data?.source === "colonist-session-collector/v1") collectorBusEvents++; });
+    return Object.values(beforeCollector).map(value => Function.prototype.toString.call(value));
   });
-  assert.deepEqual(await page.evaluate(() => fixtureResponse), { fixture: "http", type: 4 });
   const viewer = await context.newPage();
   await viewer.goto(`chrome-extension://${extensionId}/viewer.html`);
+  console.log("Fixture and extension viewer loaded");
+  const send = message => viewer.evaluate(message => chrome.runtime.sendMessage(message), message);
+  const targets = await viewer.evaluate(() => chrome.debugger.getTargets());
+  const tabId = targets.find(item => item.url === `https://colonist.io:${port}/fixture`).tabId;
+  assert.equal((await send({ type: "recorder-start", tabId })).ok, true);
+  console.log("Chrome debugger attached");
+  assert.equal((await send({ type: "recorder-start", tabId })).ok, false, "duplicate start rejected");
   const read = () => viewer.evaluate(async () => {
     const db = await import("./db.js");
     const sessions = await db.listSessions();
     return sessions.length ? db.readSession(sessions[0].id) : null;
   });
-  let recording;
-  for (let attempt = 0; attempt < 40; attempt++) {
-    recording = await read();
-    if (recording?.events.some(event => event.transport === "xhr") && recording.events.filter(event => event.kind === "message").length >= 7) break;
-    await new Promise(resolve => setTimeout(resolve, 100));
-  }
-  assert.ok(recording?.events.some(event => event.transport === "fetch"), "fetch response persisted");
-  assert.ok(recording.events.some(event => event.transport === "xhr"), "XHR response persisted");
-  assert.equal(recording.events.filter(event => event.url?.includes("/api/reused-fixture")).length, 1);
-  assert.ok(!recording.events.some(event => event.url?.includes("/api/abort-fixture")), "aborted XHR listener removed");
-  assert.ok(recording.events.some(event => event.direction === "incoming" && event.payload?.encoding === "base64"), "binary incoming persisted");
-  assert.ok(recording.events.some(event => event.direction === "outgoing" && event.payload?.data === "AID/"), "typed array copied before caller mutation");
-  assert.ok(recording.events.every(event => !event.url?.includes("example.test")), "external endpoint excluded");
-  assert.ok(recording.events.every(event => !event.url?.includes("secret-fixture")), "URL token removed");
-  assert.ok(recording.events.every((event, i, events) => i === 0 || event.sequence > events[i - 1].sequence), "stored observation order preserved");
-
-  // Hold a Blob conversion open: the popup must not report the recorder idle.
-  const sourceTabId = recording.session.tabId;
-  await page.evaluate(() => {
-    const original = Blob.prototype.arrayBuffer;
-    const waiting = [];
-    window.releaseBlobCapture = () => {
-      for (const release of waiting.splice(0)) release();
-      Blob.prototype.arrayBuffer = original;
-    };
-    window.delayedBlob = new Blob(['{"fixture":"delayed-blob"}']);
-    Blob.prototype.arrayBuffer = function () {
-      if (this === delayedBlob) return new Promise(resolve => {
-        waiting.push(() => resolve(Reflect.apply(original, this, [])));
-      });
-      return Reflect.apply(original, this, []);
-    };
-    // Dispatch through the real message listener without making Playwright's
-    // mocked socket transport wait on the same intentionally held Blob.
-    fixtureSocket.dispatchEvent(new MessageEvent("message", { data: delayedBlob }));
-  });
-  async function waitForBridge(predicate) {
-    let state;
-    for (let attempt = 0; attempt < 100; attempt++) {
-      state = await viewer.evaluate(tabId => chrome.tabs.sendMessage(tabId, { type: "bridge-status" }), sourceTabId);
-      if (predicate(state)) return;
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
-    assert.fail(`Timed out waiting for bridge status: ${JSON.stringify(state)}`);
-  }
-  await waitForBridge(state => state.pendingPayloads > 0);
-  await page.evaluate(() => releaseBlobCapture());
-  await waitForBridge(state => state.pendingPayloads === 0 && state.queued === 0);
-  recording = await read();
-  assert.ok(recording.events.some(event => event.direction === "incoming" && event.payload?.data === "eyJmaXh0dXJlIjoiZGVsYXllZC1ibG9iIn0="), "pending Blob persisted before idle");
-
-  // Pausing takes effect in the page; resuming the same socket must work.
+  const state = () => send({ type: "recorder-status" });
+  await page.evaluate(async port => {
+    const ws = window.fixtureSocket = new WebSocket(`wss://socket.svr.colonist.io:${port}/?token=secret-fixture`);
+    window.received = [];
+    ws.addEventListener("message", event => received.push(event.data));
+    await new Promise((resolve, reject) => { const timer = setTimeout(() => reject(new Error("Local WSS connection timed out")), 10000);
+      ws.onopen = () => { clearTimeout(timer); resolve(); }; ws.onerror = () => { clearTimeout(timer); reject(new Error("Local WSS fixture failed")); }; });
+    ws.send('{"fixture":"socket","type":130}');
+    ws.send("binary-please");
+    ws.send(Uint8Array.from([3, 1, 6, ...new TextEncoder().encode("01a234"),
+      0x83, 0xa6, ...new TextEncoder().encode("action"), 15,
+      0xa7, ...new TextEncoder().encode("payload"), 18,
+      0xa8, ...new TextEncoder().encode("sequence"), 5]));
+    const bytes = Uint8Array.of(0, 128, 255);
+    ws.send(bytes);
+    bytes.fill(42);
+    window.fixtureResponse = await (await fetch("/api/fetch")).json();
+    await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("GET", "/api/xhr");
+      xhr.onload = resolve;
+      xhr.onerror = reject;
+      xhr.send();
+    });
+    // Real loopback TLS endpoint under a lookalike domain must still be excluded.
+    const external = new WebSocket(`wss://colonist.io.example.test:${port}/socket`);
+    await new Promise((resolve, reject) => { const timer = setTimeout(() => reject(new Error("External fixture timed out")), 10000);
+      external.onopen = () => { clearTimeout(timer); resolve(); }; external.onerror = () => { clearTimeout(timer); reject(new Error("External fixture failed")); }; });
+    external.send("must-not-record-external");
+    external.close();
+    await fetch(`https://colonist.io.example.test:${port}/api/external`);
+  }, port);
+  assert.deepEqual(await page.evaluate(() => fixtureResponse), { fixture: "http", type: 4 });
+  console.log("Real TLS/WSS fixture traffic completed");
+  let recording = await until(read, value => value?.events.some(event => event.transport === "xhr") &&
+    value.events.filter(event => event.kind === "message").length >= 9, "initial messages and HTTP");
+  assert.ok(recording.events.some(event => event.transport === "fetch" && event.payload?.data.includes('"fixture":"http"')), "CDP HTTP body retrieved");
+  assert.ok(recording.events.some(event => event.direction === "outgoing" && event.payload?.data === "AID/"), "typed array preserved");
+  assert.ok(recording.events.some(event => event.direction === "incoming" && event.payload?.encoding === "base64"), "binary incoming");
+  assert.ok(recording.events.every(event => !event.url?.includes("example.test") && !event.url?.includes("secret-fixture")), "domain/token scope");
+  assert.deepEqual(await page.evaluate(() => Object.values(beforeCollector).map(value => Function.prototype.toString.call(value))), originals);
+  assert.equal(await page.evaluate(() => beforeCollector.WebSocket === WebSocket && beforeCollector.send === WebSocket.prototype.send &&
+    beforeCollector.fetch === fetch && beforeCollector.open === XMLHttpRequest.prototype.open && beforeCollector.xhrSend === XMLHttpRequest.prototype.send), true, "native functions unchanged");
+  assert.equal(await page.evaluate(() => collectorBusEvents), 0, "no collector window message bridge");
+  assert.equal(await page.evaluate(() => Boolean(window[Symbol.for("colonist-session-collector.installed")])), false, "no page hook marker");
+  await viewer.locator("#refresh").click();
+  await viewer.locator("#export").click();
+  await until(() => viewer.locator("#error").textContent(), value => value.includes("Stop recording"), "active export guard");
   await viewer.evaluate(() => chrome.storage.local.set({ recordingEnabled: false }));
-  await page.waitForTimeout(150);
-  await page.evaluate(() => fixtureSocket.send("must-not-record-paused"));
-  await page.waitForTimeout(350);
+  await until(state, value => !value.enabled, "paused state");
+  await page.evaluate(async () => {
+    fixtureSocket.send("must-not-record-paused");
+    await new Promise(resolve => {
+      const listener = event => { if (event.data === "must-not-record-paused") { fixtureSocket.removeEventListener("message", listener); resolve(); } };
+      fixtureSocket.addEventListener("message", listener);
+    });
+  });
+  await delay();
   await viewer.evaluate(() => chrome.storage.local.set({ recordingEnabled: true }));
-  await page.waitForTimeout(150);
-  await page.evaluate(() => fixtureSocket.send("record-after-resume"));
+  await until(state, value => value.enabled, "resumed state");
   await page.evaluate(() => {
+    fixtureSocket.send("record-after-resume");
     for (let i = 0; i < 120; i++) fixtureSocket.send(JSON.stringify({ burst: i }));
   });
-  // IndexedDB writes and bridge acknowledgements are asynchronous; wait for
-  // persisted burst completion instead of assuming a fixed 350 ms flush time.
-  for (let attempt = 0; attempt < 100; attempt++) {
-    recording = await read();
-    if (recording.events.filter(event => event.direction === "incoming" && event.payload?.encoding === "text" && event.payload.data.startsWith('{"burst":')).length === 120) break;
-    await page.waitForTimeout(100);
-  }
+  recording = await until(read, value => value.events.filter(event => event.direction === "incoming" && event.payload?.data.startsWith('{"burst":')).length === 120, "burst persisted");
   assert.ok(!recording.events.some(event => event.payload?.data === "must-not-record-paused"));
   assert.ok(recording.events.some(event => event.payload?.data === "record-after-resume"));
-  assert.ok(recording.events.some(event => event.kind === "pause"));
-  assert.ok(recording.events.some(event => event.kind === "resume"));
-  assert.equal(recording.events.filter(event => event.direction === "incoming" && event.payload?.encoding === "text" && event.payload.data.startsWith('{"burst":')).length, 120, "burst stored across batches");
-
-  // DB retries must be idempotent, without inflating the event count.
+  await page.reload();
+  assert.equal((await state()).activeTabId, tabId, "attachment survives same-site reload");
+  await page.evaluate(() => fetch("/api/after-reload"));
+  await until(read, value => value.events.some(event => event.url?.endsWith("/api/after-reload")), "reload HTTP persisted");
+  await page.goto(`https://colonist.io.example.test:${port}/outside`);
+  await until(state, value => value.activeTabId === null && !value.queued && !value.pendingBodies, "automatic detach outside scope");
+  assert.equal((await send({ type: "recorder-start", tabId })).ok, false, "lookalike attachment rejected");
+  recording = await read();
+  assert.ok(recording.events.some(event => event.kind === "stop"));
   const count = recording.events.length;
-  await viewer.evaluate(async recording => {
-    const { saveBatch } = await import("./db.js");
-    await saveBatch(recording.session, recording.events);
-  }, recording);
-  assert.equal((await read()).session.eventCount, count);
+  await viewer.evaluate(async recording => { const { saveBatch } = await import("./db.js"); await saveBatch(recording.session, recording.events); }, recording);
+  assert.equal((await read()).session.eventCount, count, "duplicate writes idempotent");
   await page.close();
   await viewer.reload();
-  assert.equal((await read()).events.length, count, "recording survives closing source tab");
-  await viewer.locator("#refresh").click();
+  assert.equal((await read()).events.length, count, "data survives source close and UI reload");
   await viewer.locator("#search").fill('"type": 91');
-  assert.ok(await viewer.locator("#events tr").count() > 0, "decoded MessagePack searchable");
-  await viewer.locator("#events tr").first().click();
-  assert.match(await viewer.locator("#decoded").textContent(), /msgpack/);
+  assert.ok(await viewer.locator("#events tr").count() > 0, "MessagePack searchable");
   await viewer.locator("#search").fill("colonist-client-msgpack");
-  assert.equal(await viewer.locator("#events tr").count(), 1, "only outgoing fixture decoded as client framing");
+  assert.equal(await viewer.locator("#events tr").count(), 1);
   await viewer.locator("#events tr").first().click();
   assert.match(await viewer.locator("#decoded").textContent(), /"action": 15/);
   const downloadPromise = viewer.waitForEvent("download");
   await viewer.locator("#export").click();
   const download = await downloadPromise;
   const saved = JSON.parse(await fs.readFile(await download.path(), "utf8"));
-  assert.equal(saved.schema, "colonist-session-collector/v1");
+  assert.equal(saved.extensionVersion, "0.2.0");
   assert.equal(saved.events.length, count);
   assert.ok(saved.events.some(event => event.decoded?.format === "msgpack" && event.decoded.value.type === 91));
-  assert.ok(saved.events.some(event => event.decoded?.format === "colonist-client-msgpack" && event.decoded.value.action === 15));
-  await viewer.screenshot({ path: path.join(root, "tmp", "recordings-smoke.png"), fullPage: true });
-
-  const unrelated = await context.newPage();
-  await unrelated.goto("https://colonist.io.example.test/fixture");
-  assert.equal(await unrelated.evaluate(() => Boolean(window[Symbol.for("colonist-session-collector.installed")])), false);
+  assert.ok(saved.events.every((event, i) => !i || event.sequence > saved.events[i - 1].sequence));
+  // Explicit stop also releases the debugger; opening DevTools/user cancellation is an interruption.
+  const second = await context.newPage();
+  await second.goto(`https://colonist.io:${port}/second`);
+  const secondId = (await viewer.evaluate(() => chrome.debugger.getTargets())).find(item => item.url.endsWith("/second")).tabId;
+  assert.equal((await send({ type: "recorder-start", tabId: secondId })).ok, true);
+  assert.equal((await send({ type: "recorder-stop" })).ok, true);
+  await until(state, value => value.activeTabId === null && !value.queued, "explicit stop drains");
+  assert.equal((await send({ type: "recorder-start", tabId: secondId })).ok, true);
+  await second.close();
+  await until(state, value => value.activeTabId === null && !value.queued, "closed target detach");
+  assert.ok((await read()).events.some(event => event.kind === "gap"), "unexpected detach marked as gap");
+  await viewer.locator("#refresh").click();
+  await viewer.screenshot({ path: path.join(root, "tmp", "debugger-recordings-smoke.png"), fullPage: true });
   assert.deepEqual(errors, []);
-  console.log(JSON.stringify({ passed: true, events: count, export: download.suggestedFilename(), extensionId, screenshot: "tmp/recordings-smoke.png" }));
+  console.log(JSON.stringify({ passed: true, events: count, transport: "actual CDP over loopback TLS/WSS", export: download.suggestedFilename(), screenshot: "tmp/debugger-recordings-smoke.png" }));
 } finally {
-  await context.close();
+  if (context) await context.close();
+  for (const ws of sockets) ws.close();
+  for (const socket of connections) socket.destroy();
+  server.closeAllConnections();
+  await new Promise(resolve => server.close(resolve));
 }

@@ -33,7 +33,7 @@ async function refreshSessions() {
   }
   if (!sessions.length) {
     const option = document.createElement("option");
-    option.textContent = "No recordings yet — open or refresh Colonist";
+    option.textContent = "No recordings yet — start from the extension popup on Colonist";
     option.value = "";
     $("#sessions").append(option);
   } else if (sessions.some(session => session.id === previousId)) $("#sessions").value = previousId;
@@ -59,9 +59,10 @@ async function loadRecording() {
     $("#summary").textContent = `${recording.events.length} events · ` +
       Object.entries(counts).map(([source, count]) => `${count} ${source}`).join(" · ");
     const problems = recording.events.filter(event => ["gap", "pause", "resume"].includes(event.kind) || event.captureError || event.payload?.encoding === "omitted");
-    if (problems.length || recording.session.bridgeDropped) {
+    const dropped = (recording.session.bridgeDropped || 0) + (recording.session.captureDropped || 0);
+    if (problems.length || dropped) {
       $("#warning").hidden = false;
-      $("#warning").textContent = `${problems.length} capture warning(s); ${recording.session.bridgeDropped || 0} bridge events dropped. Inspect the trace before reconstructing a game.`;
+      $("#warning").textContent = `${problems.length} capture warning(s); ${dropped} events dropped. Inspect the trace before reconstructing a game.`;
     }
   } else $("#summary").textContent = "No recorded sessions yet. Start before joining a game to capture the initial state.";
   filterEvents();
@@ -110,6 +111,11 @@ $("#search").addEventListener("input", () => { page = 0; filterEvents(); });
 $("#previous").addEventListener("click", () => { page--; renderEvents(); });
 $("#next").addEventListener("click", () => { page++; renderEvents(); });
 $("#export").addEventListener("click", () => { void run(async () => {
+  const state = await chrome.runtime.sendMessage({ type: "recorder-status" });
+  if (!state?.ok) throw new Error(state?.error || "Could not check recorder status.");
+  if (state.sessionId === recording.session.id && (state.activeTabId !== null || state.queued || state.pendingBodies)) {
+    throw new Error("Stop recording in the popup and wait for zero pending events before exporting this session.");
+  }
   const latest = await readSession(recording.session.id);
   const url = URL.createObjectURL(new Blob([json(makeExport(latest))], { type: "application/json" }));
   const anchor = document.createElement("a");
@@ -119,6 +125,11 @@ $("#export").addEventListener("click", () => { void run(async () => {
   setTimeout(() => URL.revokeObjectURL(url), 60000);
 }); });
 $("#delete").addEventListener("click", () => { void run(async () => {
+  const state = await chrome.runtime.sendMessage({ type: "recorder-status" });
+  if (!state?.ok) throw new Error(state?.error || "Could not check recorder status.");
+  if (state.sessionId === recording.session.id && (state.activeTabId !== null || state.queued || state.pendingBodies)) {
+    throw new Error("Stop recording and wait for pending events before deleting this session.");
+  }
   if (!confirm("Delete this local recording? Export it first if you want to keep it.")) return;
   await deleteSession(recording.session.id);
   await refreshSessions();
