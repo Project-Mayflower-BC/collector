@@ -1,0 +1,20 @@
+node_modules/
+tmp/
+*.zip
+*.crx
+*.pem
+.env
+.env.*
+!.env.example
+
+# Private session exports and local capture material.
+colonist-*.json
+recordings/
+captures/
+exports/
+Screenshot*.png
+Screenshot*.jpg
+Screenshot*.jpeg
+
+.DS_Store
+Thumbs.db

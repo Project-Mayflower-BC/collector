@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Colonist Collector</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body class="popup">
+  <p class="eyebrow">COLONIST COLLECTOR</p>
+  <h1>Your game, recorded.</h1>
+  <p>Payloads stay in this browser until you export them.</p>
+  <label class="toggle"><input id="enabled" type="checkbox"> Record Colonist sessions</label>
+  <p id="status" role="status">Checking recorder…</p>
+  <button id="open" class="primary">Open recordings</button>
+  <p class="muted small">Refresh an existing Colonist tab after installing. Start before joining a game for a complete recording.</p>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>
