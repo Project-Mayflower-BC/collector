@@ -2,6 +2,20 @@
 
 A no-build Chrome Manifest V3 extension for recording the network messages delivered to your own Colonist tab. Recordings stay in the extension's local IndexedDB until you explicitly export or delete them. There is no backend, telemetry, replay scraping, or gameplay automation.
 
+## Choosing a branch
+
+Two capture approaches are kept side by side until one is chosen:
+
+| | `main`: page-hook injection (v0.1.3) | `experiment/debugger-capture`: Chrome debugger (v0.4.0) |
+| --- | --- | --- |
+| How it captures | Content scripts wrap the page's `WebSocket`, `fetch` and XHR | `chrome.debugger` reads CDP Network events; nothing is injected into the page |
+| Starting | Automatic on every Colonist page load | Explicit **Start on this tab**, then refresh Colonist |
+| Visible to the page | Yes: wrapped page APIs and a message bridge | No page changes, but Chrome shows a debugging banner (optional launcher hides it) |
+| Permissions | `storage`, `unlimitedStorage` | adds `debugger`, `downloads`, `offscreen` |
+| Saving | Stays in the extension until exported | Saved to Downloads as JSON on stop |
+| Heartbeat/analytics filtering, game-gap checks | No | Yes |
+| Validated against a full live game | Recordings used for PROTOCOL.md | Complete game from setup to result, plus worker-restart recovery |
+
 ## Install in Chrome
 
 1. Open `chrome://extensions`.
