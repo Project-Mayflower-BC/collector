@@ -37,6 +37,7 @@ All outgoing binary messages in this recording follow this observed layout:
 | First two bytes | Route | Body shape |
 | --- | --- | --- |
 | `[2, 2]`, `[2, 10]`, `[2, 11]`, `[2, 12]` | `lobby` | Lobby actions or requests |
+| `[2, 7]` | `lobby` | Numeric `{ action, payload }` lobby requests; observed in the debugger capture below |
 | `[3, 1]` | Server route (numeric in the first sample; alphanumeric in the second) | `{ action, payload, sequence }` |
 | `[4, 8]` | Empty | `{ id: "136", data: { timestamp } }` |
 
@@ -73,3 +74,11 @@ A second export from 2026-10-11 UTC was compared with three user-provided screen
 This second sample uses `diceSetting: 0`, `hideBankCards: true`, and `friendlyRobber: false`, unlike the first sample. All four initial `playerUserStates` have `isBot: false`; later disconnect/substitution behavior has not been fully interpreted. This gives additional protocol coverage but does not establish a bot-performance benchmark.
 
 The local validation script and board diagrams are under ignored `tmp/`; neither private export nor screenshots are copied into the repository. The replay adapter still needs broader validation of reconnection/reset and null/deletion behavior before being treated as a general rules-validated replay.
+
+## Debugger capture: complete game and analytics-only control
+
+A v0.2.1 debugger export recorded on 2026-10-11 UTC contains 3,392 continuous recorder events, including 999 consecutive incoming game-channel messages numbered 1–999. The initial snapshot precedes the first placement, has no occupied corners, and includes 19 hexes, 54 corners, 72 edges and nine ports. The next map changes contain all eight setup settlements and eight setup roads. The trace includes 406 state diffs, ten chat text entries and a type-45 result at server sequence 998, followed by a final state update. Reported duration is about 17 minutes with 74 turns including setup. No capture errors, omitted payloads, drops or interruptions are reported. This is evidence of a complete numbered game channel, not a general guarantee across all targets or contexts.
+
+Seventeen outgoing messages initially appeared as binary because their `[2, 7, 5]` header was outside the decoder's accepted families. Removing the three-byte header and five-byte `lobby` route yields valid MessagePack for all seventeen: seven numeric payloads, seven empty objects and three objects with `date` and `notificationCountToSend: 25`. All precede the first settlement placement. The latter likely request notifications; exact semantics of the other numeric action codes are unverified. v0.2.2 accepts this observed header without assigning action names. Original bytes remain unchanged, and existing local recordings are decoded afresh when viewed/exported.
+
+A separate recording lasted about 16 minutes but contained only start/stop and eleven `/api/analytic-events` responses with value `true`. It had no WebSocket messages or navigation marker despite an attached, healthy debugger. The file does not establish the cause, but is consistent with attachment after an existing socket was created and no subsequent refresh. v0.2.2 warns when no socket data messages have been observed, and the viewer flags recordings containing none. This check does not prove receipt of setup or an end result when sockets are present. Both exports remain private and outside the repository.

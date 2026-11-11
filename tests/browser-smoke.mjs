@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import fs from "node:fs/promises";
 import https from "node:https";
+import os from "node:os";
 import { execFileSync } from "node:child_process";
 const require = createRequire(import.meta.url);
 const playwrightPath = process.env.PLAYWRIGHT_MODULE || "playwright";
@@ -38,7 +39,8 @@ server.on("upgrade", (req, socket, head) => {
 await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
 const port = server.address().port;
 await fs.mkdir(path.join(root, "tmp"), { recursive: true });
-const profile = await fs.mkdtemp(path.join(root, "tmp", "debugger-browser-"));
+// Outside the extension directory: Chromium scans an unpacked extension's folder when loading it.
+const profile = await fs.mkdtemp(path.join(os.tmpdir(), "collector-smoke-"));
 let context;
 const errors = [];
 const delay = () => new Promise(resolve => setTimeout(resolve, 100));
@@ -62,6 +64,9 @@ try {
   });
   context.setDefaultTimeout(15000);
   console.log("Isolated Chromium launched");
+  // Wait for the worker before routing: interception set up mid-load can stall the extension's
+  // service worker. Polling also avoids missing a serviceworker event that has already fired.
+  const worker = await until(() => context.serviceWorkers()[0], Boolean, "extension service worker");
   // Fail closed: only this test server is accessible to page requests.
   await context.route("**/*", route => {
     const url = new URL(route.request().url());
@@ -71,7 +76,6 @@ try {
     return route.abort();
   });
   context.on("page", page => page.on("pageerror", error => errors.push(error.message)));
-  const worker = context.serviceWorkers()[0] || await context.waitForEvent("serviceworker");
   const extensionId = new URL(worker.url()).host;
   const page = await context.newPage();
   await page.goto(`https://colonist.io:${port}/fixture`);
@@ -97,6 +101,13 @@ try {
     return sessions.length ? db.readSession(sessions[0].id) : null;
   });
   const state = () => send({ type: "recorder-status" });
+  await page.evaluate(async port => { await fetch(`https://colonist.io:${port}/api/before-socket`); }, port);
+  await until(read, value => value.events.some(event => event.transport === "fetch"), "HTTP-only capture saved");
+  assert.equal((await state()).webSocketMessageCount, 0, "HTTP traffic alone does not establish game connection capture");
+  const popup = await context.newPage();
+  await popup.goto(`chrome-extension://${extensionId}/popup.html`);
+  await until(() => popup.locator("#connection-warning").isVisible(), Boolean, "missing game connection warning");
+  await popup.close();
   await page.evaluate(async port => {
     const ws = window.fixtureSocket = new WebSocket(`wss://socket.svr.colonist.io:${port}/?token=secret-fixture`);
     window.received = [];
@@ -162,8 +173,8 @@ try {
   await until(read, value => value.events.some(event => event.payload?.data === "after-idle"), "post-idle message captured");
   console.log("Closed-UI idle check passed");
   await viewer.locator("#refresh").click();
-  await viewer.locator("#export").click();
-  await until(() => viewer.locator("#error").textContent(), value => value.includes("Stop recording"), "active export guard");
+  await until(() => viewer.locator("#export").textContent(), value => value === "Stop & save", "live recording offers Stop & save");
+  assert.equal(await viewer.locator("#delete").isDisabled(), true, "live recording cannot be deleted");
   await viewer.evaluate(() => chrome.storage.local.set({ recordingEnabled: false }));
   await until(state, value => !value.enabled, "paused state");
   await page.evaluate(async () => {
@@ -188,55 +199,79 @@ try {
   assert.equal((await state()).activeTabId, tabId, "attachment survives same-site reload");
   await page.evaluate(() => fetch("/api/after-reload"));
   await until(read, value => value.events.some(event => event.url?.endsWith("/api/after-reload")), "reload HTTP persisted");
-  await page.goto(`https://colonist.io.example.test:${port}/outside`);
-  await until(state, value => value.activeTabId === null && !value.queued && !value.pendingBodies, "automatic detach outside scope");
-  assert.equal((await send({ type: "recorder-start", tabId })).ok, false, "lookalike attachment rejected");
-  recording = await read();
-  assert.ok(recording.events.some(event => event.kind === "stop"));
-  const count = recording.events.length;
-  await viewer.evaluate(async recording => { const { saveBatch } = await import("./db.js"); await saveBatch(recording.session, recording.events); }, recording);
-  assert.equal((await read()).session.eventCount, count, "duplicate writes idempotent");
-  await page.close();
-  await viewer.reload();
-  assert.equal((await read()).events.length, count, "data survives source close and UI reload");
+  // Search and decoding of the live recording, before stopping clears it from storage.
+  await viewer.locator("#refresh").click();
   await viewer.locator("#search").fill('"type": 91');
   assert.ok(await viewer.locator("#events tr").count() > 0, "MessagePack searchable");
   await viewer.locator("#search").fill("colonist-client-msgpack");
   assert.equal(await viewer.locator("#events tr").count(), 1);
   await viewer.locator("#events tr").first().click();
   assert.match(await viewer.locator("#decoded").textContent(), /"action": 15/);
-  const downloadPromise = viewer.waitForEvent("download");
-  await viewer.locator("#export").click();
-  const download = await downloadPromise;
-  const saved = JSON.parse(await fs.readFile(await download.path(), "utf8"));
-  assert.equal(saved.extensionVersion, "0.2.1");
-  assert.equal(saved.events.length, count);
+  await viewer.locator("#search").fill("");
+  const files = count => until(() => viewer.evaluate(() => chrome.downloads.search({ state: "complete", orderBy: ["startTime"] })),
+    items => items.length >= count, `${count} JSON file(s) saved to Downloads`);
+  const savedFile = async item => JSON.parse(await fs.readFile(item.filename, "utf8"));
+  const stored = () => viewer.evaluate(async () => (await (await import("./db.js")).listSessions()).length);
+  await page.goto(`https://colonist.io.example.test:${port}/outside`);
+  await until(state, value => value.activeTabId === null && !value.saving, "automatic detach outside scope saves the file");
+  assert.equal((await send({ type: "recorder-start", tabId })).ok, false, "lookalike attachment rejected");
+  const [first] = await files(1);
+  const saved = await savedFile(first);
+  assert.equal(saved.extensionVersion, "0.4.0");
+  assert.equal(saved.session.id, recording.session.id);
+  assert.ok(saved.events.some(event => event.kind === "stop"));
   assert.ok(saved.events.some(event => event.decoded?.format === "msgpack" && event.decoded.value.type === 91));
+  assert.ok(saved.events.some(event => event.url?.endsWith("/api/after-reload")));
   assert.ok(saved.events.every((event, i) => !i || event.sequence > saved.events[i - 1].sequence));
+  assert.equal(await stored(), 0, "saving the JSON clears the local copy");
+  assert.match((await state()).notice, /Saved colonist-.*\.json to Downloads/);
+  // A recording left in storage (e.g. after a failed save) is saved from the viewer, then cleared.
+  const count = saved.events.length;
+  const restored = { session: saved.session, events: saved.events.map(({ decoded, ...event }) => event) };
+  await viewer.evaluate(async recording => { const { saveBatch } = await import("./db.js"); await saveBatch(recording.session, recording.events); await saveBatch(recording.session, recording.events); }, restored);
+  assert.equal((await viewer.evaluate(async id => (await import("./db.js")).readSession(id), saved.session.id)).session.eventCount, count, "duplicate writes idempotent");
+  await page.close();
+  await viewer.reload();
+  await viewer.locator("#export").click();
+  await until(() => viewer.locator("#summary").textContent(), value => value.includes("cleared it from the extension"), "viewer save and clear");
+  assert.equal((await savedFile((await files(2))[1])).events.length, count);
+  assert.equal(await stored(), 0);
   // Explicit stop also releases the debugger; opening DevTools/user cancellation is an interruption.
   const second = await context.newPage();
   await second.goto(`https://colonist.io:${port}/second`);
   const secondId = (await viewer.evaluate(() => chrome.debugger.getTargets())).find(item => item.url.endsWith("/second")).tabId;
   assert.equal((await send({ type: "recorder-start", tabId: secondId })).ok, true);
-  assert.equal((await send({ type: "recorder-stop" })).ok, true);
-  await until(state, value => value.activeTabId === null && !value.queued, "explicit stop drains");
+  // The viewer's Stop & save stops the live recording, which saves it.
+  await viewer.locator("#refresh").click();
+  await until(() => viewer.locator("#export").textContent(), value => value === "Stop & save", "Stop & save offered");
+  await viewer.locator("#export").click();
+  await until(() => viewer.locator("#summary").textContent(), value => /Saved colonist-.*\.json to Downloads/.test(value), "Stop & save completes");
+  await until(state, value => value.activeTabId === null && !value.queued && !value.saving, "explicit stop drains and saves");
+  assert.equal(await viewer.locator("#error").isHidden(), true);
+  assert.equal((await savedFile((await files(3))[2])).session.stopCode, "user_stop");
   assert.equal((await send({ type: "recorder-start", tabId: secondId })).ok, true);
   await second.close();
-  await until(state, value => value.activeTabId === null && !value.queued, "closed target detach");
-  assert.ok((await read()).events.some(event => event.kind === "gap"), "unexpected detach marked as gap");
+  await until(state, value => value.activeTabId === null && !value.queued && !value.saving, "closed target detach");
+  const closedFile = (await files(4))[3];
+  const ended = await savedFile(closedFile);
+  assert.ok(ended.events.some(event => event.kind === "gap"), "unexpected detach marked as gap");
   assert.equal(await viewer.evaluate(() => chrome.action.getBadgeText({})), "ERR");
-  const ended = await read();
   assert.equal(ended.session.stopCode, "debugger_detached");
   assert.ok(ended.session.detachReason);
   assert.equal((await viewer.evaluate(() => chrome.storage.local.get("recorderNotice"))).recorderNotice.unexpected, true);
-  await viewer.locator("#refresh").click();
+  // Saved files open read-only in the viewer.
+  await viewer.locator("#open-file").setInputFiles(closedFile.filename);
+  await until(() => viewer.locator("#warning").textContent(), value => value.includes("No WebSocket messages captured"), "analytics-only recording warning");
+  assert.equal(await viewer.locator("#export").isDisabled(), true);
   await viewer.screenshot({ path: path.join(root, "tmp", "debugger-recordings-smoke.png"), fullPage: true });
   assert.deepEqual(errors, []);
-  console.log(JSON.stringify({ passed: true, events: count, transport: "actual CDP over loopback TLS/WSS", export: download.suggestedFilename(), screenshot: "tmp/debugger-recordings-smoke.png" }));
+  console.log(JSON.stringify({ passed: true, events: count, transport: "actual CDP over loopback TLS/WSS", export: saved.session.id, screenshot: "tmp/debugger-recordings-smoke.png" }));
 } finally {
-  if (context) await context.close();
+  // A failed run can leave the browser unresponsive; never let cleanup hide the error.
+  if (context) await Promise.race([context.close(), new Promise(resolve => setTimeout(resolve, 10000))]);
   for (const ws of sockets) ws.close();
   for (const socket of connections) socket.destroy();
   server.closeAllConnections();
   await new Promise(resolve => server.close(resolve));
+  await fs.rm(profile, { recursive: true, force: true, maxRetries: 5 }).catch(() => {});
 }

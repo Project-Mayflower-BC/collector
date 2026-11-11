@@ -35,6 +35,8 @@ test("CDP WebSocket text/binary/control preserve bytes and metadata without head
   assert.equal(events[3].direction, "outgoing");
   assert.equal(events[4].kind, "control");
   assert.equal(events[4].payload.byteLength, 1);
+  assert.equal(h.writer.metadata.webSocketMessageCount, 2, "control frames do not count as game connection messages");
+  assert.ok(h.writer.metadata.lastWebSocketMessageAt);
   assert.ok(events.every(event => !event.url?.includes("private") && !event.headers));
 });
 test("lookalike/external sockets and HTTP redirects never reach storage", async () => {
@@ -136,4 +138,19 @@ test("writer retries identical keys; pending includes unacknowledged writes and 
   writes[3].resolve();
   await tick();
   assert.equal(writer.status().queued, 0);
+});
+test("a socket first seen mid-stream is adopted and marked unverified; rejected sockets stay ignored", async () => {
+  const h = harness();
+  await h.capture.handle("Network.webSocketCreated", { requestId: "evil", url: "wss://colonist.io.evil.test/" });
+  await h.capture.handle("Network.webSocketFrameReceived", { ...frame("external"), requestId: "evil" });
+  await h.capture.handle("Network.webSocketFrameReceived", frame("missed-creation"));
+  await h.capture.handle("Network.webSocketFrameSent", frame("second"));
+  await tick();
+  const events = h.events();
+  assert.deepEqual(events.map(event => event.kind), ["connect", "message", "message"]);
+  assert.equal(events[0].unverified, true);
+  assert.equal(events[0].url, null);
+  assert.equal(events[1].payload.data, "missed-creation");
+  assert.equal(events[2].connectionId, "ws-ws");
+  assert.ok(!events.some(event => event.payload?.data === "external"));
 });

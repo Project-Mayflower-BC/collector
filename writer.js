@@ -18,6 +18,10 @@ export class EventWriter {
     const timestamp = new Date().toISOString();
     this.metadata.lastEventAt = timestamp;
     if (["message", "response"].includes(fields.kind)) this.metadata.lastMessageAt = timestamp;
+    if (fields.transport === "websocket" && fields.kind === "message") {
+      this.metadata.webSocketMessageCount = (this.metadata.webSocketMessageCount || 0) + 1;
+      this.metadata.lastWebSocketMessageAt = timestamp;
+    }
     return { ...fields, sequence: ++this.sequence, timestamp };
   }
   updateMetadata(fields) {
@@ -26,6 +30,21 @@ export class EventWriter {
     void this.pump();
   }
   emit(fields) { this.enqueue(this.reserve(fields)); }
+  // Counts traffic deliberately not stored (heartbeats, analytics, static assets). Heartbeats still
+  // show the connection is alive. Persisted with the next batch or health check.
+  skip(category, bytes = 0, websocket = false) {
+    const timestamp = new Date().toISOString();
+    const filtered = this.metadata.filtered ??= {};
+    const entry = filtered[category] ??= { count: 0, bytes: 0 };
+    entry.count++;
+    entry.bytes += bytes;
+    this.metadata.lastEventAt = timestamp;
+    if (websocket) {
+      this.metadata.lastMessageAt = timestamp;
+      this.metadata.webSocketMessageCount = (this.metadata.webSocketMessageCount || 0) + 1;
+      this.metadata.lastWebSocketMessageAt = timestamp;
+    }
+  }
   enqueue(event) {
     const size = JSON.stringify(event).length * 2;
     if (this.queue.length + this.inFlight >= this.maxEvents || this.bytes + size > this.maxBytes) {

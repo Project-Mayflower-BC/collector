@@ -94,6 +94,19 @@ test("recognizes lobby and heartbeat client frames without assigning header sema
   assert.deepEqual(decodeColonistClientFrame(heartbeat).value, { id: "136", data: { timestamp: 1 } });
 });
 
+test("decodes the numeric lobby action header observed before placement", () => {
+  // Synthetic notification-like payload, with no captured dates or identifiers.
+  const frame = Uint8Array.from([2, 7, 5, ...new TextEncoder().encode("lobby"),
+    0x82, 0xa6, ...new TextEncoder().encode("action"), 7,
+    0xa7, ...new TextEncoder().encode("payload"), 0x80]);
+  const payload = { encoding: "base64", data: toBase64(frame) };
+  assert.deepEqual(decodePayload(payload, outgoingContext), {
+    format: "colonist-client-msgpack", headerBytes: [2, 7, 5], route: "lobby", value: { action: 7, payload: {} }
+  });
+  assert.equal(decodePayload(payload, { ...outgoingContext, direction: "incoming" }).format, "binary");
+  assert.equal(decodePayload({ ...payload, data: toBase64(frame.subarray(0, frame.length - 1)) }, outgoingContext).format, "binary");
+});
+
 test("rejects truncated, unknown and malformed client frames while retaining raw bytes", () => {
   for (const frame of [actionFrame.subarray(0, 8), Uint8Array.of(3, 1, 255, 0),
     Uint8Array.from([9, ...actionFrame.subarray(1)]), Uint8Array.from([...actionFrame, 0]),

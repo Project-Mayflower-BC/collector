@@ -16,6 +16,10 @@ button, select, input[type="search"] { font: inherit; border: 1px solid #c8d4ce;
 button { cursor: pointer; white-space: nowrap; font-weight: 600; }
 button:hover { background: #eaf0eb; }
 button:disabled { opacity: .45; cursor: default; }
+.file-button { font-weight: 600; border: 1px solid #c8d4ce; border-radius: 7px; padding: 10px 12px; background: white; cursor: pointer; white-space: nowrap; }
+.file-button:hover { background: #eaf0eb; }
+.file-button input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.file-button:focus-within { outline: 2px solid #086f64; outline-offset: 2px; }
 .primary { background: #086f64; color: white; border-color: #086f64; }
 .primary:hover { background: #07564e; }
 select, input[type="search"] { display: block; width: 100%; margin-top: 8px; }

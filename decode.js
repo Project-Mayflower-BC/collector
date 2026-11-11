@@ -123,7 +123,7 @@ export function decodeMessagePack(input) {
 export function decodeColonistClientFrame(bytes) {
   if (bytes.length < 4) throw new Error("Truncated Colonist client frame.");
   const [family, code, routeLength] = bytes;
-  const known = (family === 2 && [2, 10, 11, 12].includes(code)) ||
+  const known = (family === 2 && [2, 7, 10, 11, 12].includes(code)) ||
     (family === 3 && code === 1) || (family === 4 && code === 8);
   if (!known || 3 + routeLength >= bytes.length) throw new Error("Unrecognized Colonist client header.");
   const route = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(3, 3 + routeLength));
@@ -156,7 +156,9 @@ export function decodePayload(payload, event = {}) {
     } catch { /* Binary MessagePack need not be UTF-8. */ }
     try { return { format: "msgpack", value: decodeMessagePack(bytes) }; }
     catch (error) {
-      if (event.transport === "websocket" && event.direction === "outgoing" && isColonistUrl(event.url)) {
+      // Sockets first seen mid-stream are marked unverified with no URL; the tab itself was verified.
+      if (event.transport === "websocket" && event.direction === "outgoing" &&
+          (event.url == null ? event.unverified === true : isColonistUrl(event.url))) {
         try { return decodeColonistClientFrame(bytes); } catch { /* Retain unknown frames as binary. */ }
       }
       return { format: "binary", byteLength: bytes.length, decodeError: error.message };
@@ -166,10 +168,16 @@ export function decodePayload(payload, event = {}) {
   }
 }
 
+// Non-finite MessagePack floats are kept as tagged strings so the export stays valid JSON.
+export const exportJson = value => JSON.stringify(value, (_key, item) =>
+  typeof item === "number" && !Number.isFinite(item) ? { $float: String(item) } : item, 2);
+export const exportFilename = session =>
+  `colonist-${session.startedAt.replace(/[:.]/g, "-")}-${session.id.slice(0, 8)}.json`;
+
 export function makeExport(recording) {
   return {
     schema: "colonist-session-collector/v1",
-    extensionVersion: "0.2.1",
+    extensionVersion: "0.4.0",
     exportedAt: new Date().toISOString(),
     session: recording.session,
     events: [...recording.events].sort((a, b) => a.sequence - b.sequence).map(event =>

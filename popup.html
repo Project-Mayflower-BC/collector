@@ -14,9 +14,12 @@
   <p><button id="start" class="primary" disabled>Start on this tab</button> <button id="stop" disabled>Stop recording</button></p>
   <p id="status" role="status">Checking recorder…</p>
   <p id="activity" class="muted small"></p>
+  <p id="game" class="muted small"></p>
+  <p id="connection-warning" class="notice" role="status" hidden></p>
+  <p id="game-warning" class="notice" role="alert" hidden></p>
   <p id="notice" class="notice" role="status" hidden></p>
   <button id="open" class="primary">Open recordings</button>
-  <p class="muted small">Chrome shows a debugging notice while attached. Start, then refresh Colonist before joining a game. Stop recording before exporting.</p>
+  <p class="muted small">Chrome shows a debugging notice while attached. Start, then refresh Colonist before joining a game. Stopping saves the game as JSON to Downloads.</p>
   <script type="module" src="popup.js"></script>
 </body>
 </html>

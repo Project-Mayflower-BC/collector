@@ -1,5 +1,6 @@
 import { listSessions, readSession, deleteSession } from "./db.js";
-import { decodePayload, makeExport } from "./decode.js";
+import { decodePayload, exportJson as json } from "./decode.js";
+import { newGameState, observeGame, resetGameStream, finishGame, gameSummary } from "./filter.js";
 
 const $ = selector => document.querySelector(selector);
 const PAGE_SIZE = 200;
@@ -8,6 +9,7 @@ let filtered = [];
 let page = 0;
 let selectedSequence;
 let cache = new Map();
+let live = false;
 const inspect = event => {
   if (!cache.has(event.sequence)) {
     const decoded = decodePayload(event.payload, event);
@@ -15,13 +17,12 @@ const inspect = event => {
   }
   return cache.get(event.sequence);
 };
-const json = value => JSON.stringify(value, (_key, item) =>
-  typeof item === "number" && !Number.isFinite(item) ? { $float: String(item) } : item, 2);
 
 async function run(action) {
   $("#error").hidden = true;
   try { await action(); }
-  catch (error) { $("#error").textContent = String(error); $("#error").hidden = false; }
+  // Errors relayed from the background arrive already prefixed with "Error: ".
+  catch (error) { $("#error").textContent = String(error).replace(/^(Error: )+/, "Error: "); $("#error").hidden = false; }
 }
 
 async function refreshSessions() {
@@ -36,22 +37,28 @@ async function refreshSessions() {
   }
   if (!sessions.length) {
     const option = document.createElement("option");
-    option.textContent = "No recordings yet — start from the extension popup on Colonist";
+    option.textContent = "No unsaved recordings. Saved games are JSON files in Downloads; use Open JSON file.";
     option.value = "";
     $("#sessions").append(option);
   } else if (sessions.some(session => session.id === previousId)) $("#sessions").value = previousId;
   await loadRecording();
 }
 
-async function loadRecording() {
+async function loadRecording(file = null) {
   const id = $("#sessions").value;
-  recording = id ? await readSession(id) : null;
+  recording = file || (id ? await readSession(id) : null);
   cache = new Map();
   page = 0;
   selectedSequence = undefined;
-  $("#export").disabled = !recording;
-  $("#delete").disabled = !recording;
+  // The recording in progress is stopped first; stopping saves it automatically.
+  const state = recording && !file ? await chrome.runtime.sendMessage({ type: "recorder-status" }) : null;
+  live = !!state && state.activeTabId !== null && state.sessionId === recording.session.id;
+  $("#export").textContent = live ? "Stop & save" : "Save JSON & clear";
+  // A JSON file opened from disk is read-only here.
+  $("#export").disabled = !recording || !!file;
+  $("#delete").disabled = !recording || !!file || live;
   $("#warning").hidden = true;
+  $("#game-warnings").hidden = true;
   $("#detail-title").textContent = "Select an event";
   $("#detail-meta").textContent = "Raw bytes are retained; decoding is best effort.";
   $("#decoded").textContent = "No event selected.";
@@ -59,18 +66,42 @@ async function loadRecording() {
   if (recording) {
     const counts = {};
     for (const event of recording.events) counts[event.transport] = (counts[event.transport] || 0) + 1;
+    const game = checkGame(recording);
+    const skipped = Object.entries(recording.session.filtered || {}).map(([kind, { count }]) => `${count} ${kind}`);
     $("#summary").textContent = `${recording.events.length} events · ` +
-      Object.entries(counts).map(([source, count]) => `${count} ${source}`).join(" · ");
-    const problems = recording.events.filter(event => ["gap", "pause", "resume"].includes(event.kind) || event.captureError || event.payload?.encoding === "omitted");
+      Object.entries(counts).map(([source, count]) => `${count} ${source}`).join(" · ") +
+      ` · Game: ${gameSummary(game)}` + (skipped.length ? ` · Not stored: ${skipped.join(", ")}` : "");
+    const problems = recording.events.filter(event => ["gap", "pause", "resume"].includes(event.kind) || event.unverified || event.captureError || event.payload?.encoding === "omitted");
+    $("#game-warnings").hidden = !game.warningCount;
+    $("#game-warnings").replaceChildren(...game.warnings.map(warning => {
+      const item = document.createElement("li");
+      item.textContent = `${warning.eventSequence ? `Event ${warning.eventSequence}: ` : ""}${warning.message}`;
+      return item;
+    }));
     const dropped = (recording.session.bridgeDropped || 0) + (recording.session.captureDropped || 0);
-    if (problems.length || dropped || recording.session.interrupted) {
+    const noSocketMessages = !recording.events.some(event => event.transport === "websocket" && event.kind === "message");
+    if (problems.length || dropped || recording.session.interrupted || noSocketMessages) {
       $("#warning").hidden = false;
       $("#warning").textContent = `${problems.length} capture warning(s); ${dropped} events dropped. ` +
-        (recording.session.interrupted ? `Recording interrupted: ${recording.session.endReason}. ` : "") +
+        (recording.session.interrupted ? `Recording interrupted: ${(recording.session.endReason || "").replace(/\.?$/, ". ")}` : "") +
+        (noSocketMessages ? "No WebSocket messages captured; this recording may contain only analytics rather than gameplay. Start recording, then refresh Colonist before joining a game. " : "") +
         "Inspect the trace before reconstructing a game.";
     }
   } else $("#summary").textContent = "No recorded sessions yet. Start before joining a game to capture the initial state.";
   filterEvents();
+}
+
+// Recomputed from the trace so recordings made before the live check also get game warnings.
+function checkGame(current) {
+  const state = newGameState();
+  for (const event of current.events) {
+    if (event.kind === "navigation") resetGameStream(state);
+    if (event.transport !== "websocket" || event.kind !== "message" || event.direction !== "incoming") continue;
+    const value = inspect(event).value;
+    if (String(value?.id) === "130") observeGame(state, value.data, { connectionId: event.connectionId, eventSequence: event.sequence });
+  }
+  if (current.session.endedAt) finishGame(state);
+  return state;
 }
 
 function filterEvents() {
@@ -115,19 +146,34 @@ $("#refresh").addEventListener("click", () => { void run(refreshSessions); });
 $("#search").addEventListener("input", () => { page = 0; filterEvents(); });
 $("#previous").addEventListener("click", () => { page--; renderEvents(); });
 $("#next").addEventListener("click", () => { page++; renderEvents(); });
+// The background saves the file to Downloads and then clears the local copy.
 $("#export").addEventListener("click", () => { void run(async () => {
-  const state = await chrome.runtime.sendMessage({ type: "recorder-status" });
-  if (!state?.ok) throw new Error(state?.error || "Could not check recorder status.");
-  if (state.sessionId === recording.session.id && (state.activeTabId !== null || state.queued || state.pendingBodies)) {
-    throw new Error("Stop recording in the popup and wait for zero pending events before exporting this session.");
+  $("#export").disabled = true;
+  if (live) {
+    const stopped = await chrome.runtime.sendMessage({ type: "recorder-stop" });
+    if (!stopped?.ok) { $("#export").disabled = false; throw new Error(stopped?.error || "Could not stop recording."); }
+    let state = stopped;
+    for (let waited = 0; (state.saving || state.activeTabId !== null) && waited < 60000; waited += 250) {
+      await new Promise(resolve => setTimeout(resolve, 250));
+      state = await chrome.runtime.sendMessage({ type: "recorder-status" });
+    }
+    await refreshSessions();
+    $("#summary").textContent = state.notice;
+    return;
   }
-  const latest = await readSession(recording.session.id);
-  const url = URL.createObjectURL(new Blob([json(makeExport(latest))], { type: "application/json" }));
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = `colonist-${latest.session.startedAt.replace(/[:.]/g, "-")}-${latest.session.id.slice(0, 8)}.json`;
-  anchor.click();
-  setTimeout(() => URL.revokeObjectURL(url), 60000);
+  const result = await chrome.runtime.sendMessage({ type: "recorder-export", sessionId: recording.session.id });
+  if (!result?.ok) { $("#export").disabled = false; throw new Error(result?.error || "Could not export this recording."); }
+  await refreshSessions();
+  $("#summary").textContent = `Saved ${result.filename} to Downloads and cleared it from the extension.`;
+}); });
+$("#open-file").addEventListener("change", () => { void run(async () => {
+  const [file] = $("#open-file").files;
+  if (!file) return;
+  const data = JSON.parse(await file.text());
+  if (!data?.session || !Array.isArray(data.events)) throw new Error("Not a collector export.");
+  await loadRecording({ session: data.session, events: data.events });
+  $("#summary").textContent = `${file.name} · ` + $("#summary").textContent;
+  $("#open-file").value = "";
 }); });
 $("#delete").addEventListener("click", () => { void run(async () => {
   const state = await chrome.runtime.sendMessage({ type: "recorder-status" });

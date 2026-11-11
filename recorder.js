@@ -1,13 +1,35 @@
-import { saveBatch, readCheckpoint } from "./db.js";
+import { saveBatch, readCheckpoint, deleteSession } from "./db.js";
 import { isColonistUrl, safeUrl } from "./scope.js";
 import { EventWriter } from "./writer.js";
 import { NetworkCapture, PAYLOAD_LIMIT } from "./network.js";
+import { gameSummary, hasSnapshot } from "./filter.js";
+
+const gameStatus = game => game ? { summary: gameSummary(game), messages: game.messages, missing: game.missing,
+  snapshot: hasSnapshot(game), warningCount: game.warningCount, lastWarning: game.lastWarning } : null;
+
+// Builds the JSON in an offscreen document: service workers cannot create blob URLs,
+// and data URLs above ~2 MB fail to download.
+export async function prepareExport(api, sessionId) {
+  try {
+    await api.offscreen.createDocument({ url: "offscreen.html", reasons: ["BLOBS"],
+      justification: "Build the recording's JSON file for download." });
+  } catch (error) { if (!/single offscreen/i.test(String(error))) throw error; }
+  const result = await api.runtime.sendMessage({ type: "offscreen-export", sessionId });
+  if (!result?.ok) throw new Error(result?.error || "Could not prepare the JSON file.");
+  return { url: result.url, filename: result.filename, release: async () => {
+    await api.runtime.sendMessage({ type: "offscreen-revoke", url: result.url }).catch(() => {});
+  } };
+}
 
 // Dependency injection lets restart/detach races be exercised without a live browser.
 export class Recorder {
-  constructor(api, { save = saveBatch, checkpoint = readCheckpoint,
+  constructor(api, { save = saveBatch, checkpoint = readCheckpoint, remove = deleteSession,
+    prepare = sessionId => prepareExport(api, sessionId), wait = ms => new Promise(resolve => setTimeout(resolve, ms)),
     interval = (callback, ms) => setInterval(callback, ms), cancelInterval = timer => clearInterval(timer) } = {}) {
-    Object.assign(this, { api, save, checkpoint, interval, cancelInterval });
+    Object.assign(this, { api, save, checkpoint, remove, prepare, wait, interval, cancelInterval });
+    this.initialized = false;
+    this.early = [];
+    this.saving = new Set();
     this.active = null;
     this.lastWriter = null;
     this.enabled = true;
@@ -29,7 +51,13 @@ export class Recorder {
       try { await this.setNotice(`Recorder initialization failed: ${String(error)}`, true); }
       catch { this.notice = { message: `Recorder initialization failed: ${String(error)}`, unexpected: true, at: new Date().toISOString() }; }
       await this.badge().catch(() => {});
-    });
+    }).finally(() => this.replayEarly());
+  }
+  replayEarly() {
+    this.initialized = true;
+    const early = this.early;
+    this.early = [];
+    for (const [source, method, params] of early) this.handle(source, method, params);
   }
   ledger(operation) {
     const result = this.ledgerWrites.then(operation);
@@ -41,7 +69,8 @@ export class Recorder {
   }
   async clearLedger() {
     await this.ledger(async () => {
-      if (!this.active && !this.pending()) await this.api.storage.session.remove("debuggerRecording");
+      // Kept while saving, so a worker restart mid-save can finish the JSON export.
+      if (!this.active && !this.pending() && !this.saving.size) await this.api.storage.session.remove("debuggerRecording");
     });
   }
   async badge() {
@@ -84,7 +113,10 @@ export class Recorder {
       const metadata = { ...prior, ...checkpoint.session };
       if (metadata.endedAt) {
         try { await this.api.debugger.detach({ tabId: prior.tabId }); } catch { /* Session already ended. */ }
-        await this.api.storage.session.remove("debuggerRecording");
+        // The worker stopped before the JSON was saved; finish that now.
+        if (checkpoint.session) void this.archive(prior.id, null, metadata.endReason || "Recording stopped.", !!metadata.interrupted,
+          { sessionId: prior.id, stopCode: metadata.stopCode, lastMessageAt: metadata.lastMessageAt });
+        else await this.api.storage.session.remove("debuggerRecording");
       }
       else {
         const writer = this.writer(metadata, checkpoint.sequence);
@@ -102,14 +134,20 @@ export class Recorder {
           Object.assign(writer.metadata, { endedAt: new Date().toISOString(), stopCode: "worker_session_lost", endReason: String(error), interrupted: true });
           writer.emit({ transport: "collector", kind: "stop", detail: String(error) });
           try { await this.api.debugger.detach({ tabId: prior.tabId }); } catch { /* Only an attachment owned by this extension can be detached. */ }
-          await this.setNotice(`Recording interrupted after a recorder restart: ${String(error)} Start again on Colonist, then refresh; the missing interval cannot be recovered.`, true,
-            { sessionId: prior.id, stopCode: "worker_session_lost", lastMessageAt: metadata.lastMessageAt });
+          const extra = { sessionId: prior.id, stopCode: "worker_session_lost", lastMessageAt: metadata.lastMessageAt };
+          const message = `Recording interrupted after a recorder restart: ${String(error)} Start again on Colonist, then refresh to continue.`;
+          await this.setNotice(message, true, extra);
+          void this.archive(prior.id, writer, message, true, extra);
         }
         if (frame) {
           const sameDocument = metadata.documentLoaderId && metadata.documentLoaderId === frame.loaderId;
           const capture = this.attachState(metadata, writer, frame.id, sameDocument ? checkpoint.sockets : []);
-          capture.diagnostic("gap", "Background worker restarted. Continued the existing debugger attachment; uncommitted events and HTTP bodies may be missing." +
-            (sameDocument ? "" : " The page changed or its identity is unknown; refresh Colonist to capture existing sockets and current state."));
+          // The last persisted activity bounds when the worker stopped.
+          const lastSeen = [metadata.lastHealthAt, metadata.lastEventAt].filter(Boolean).sort().at(-1);
+          const down = lastSeen ? ` Last activity before the restart: ${lastSeen} (${Math.round((Date.now() - Date.parse(lastSeen)) / 1000)} s earlier).` : "";
+          writer.emit({ transport: "collector", kind: "gap", workerDownSince: lastSeen,
+            detail: "Background worker restarted. Continued the existing debugger attachment; uncommitted events and HTTP bodies may be missing." + down +
+            (sameDocument ? "" : " The page changed or its identity is unknown; sockets already open are picked up from their next message.") });
           try {
             await this.api.debugger.sendCommand({ tabId: prior.tabId }, "Page.enable");
             await this.api.debugger.sendCommand({ tabId: prior.tabId }, "Network.enable", {
@@ -154,6 +192,8 @@ export class Recorder {
       if (this.active?.capture !== capture) throw new Error("Recording interrupted during attachment.");
       await this.setNotice(null);
       if (this.active?.capture !== capture) throw new Error("Recording interrupted during attachment.");
+      this.active.visible = true;
+      try { this.active.windowId = (await this.api.tabs.get(tabId)).windowId; } catch { /* Tab-switch logging is best effort. */ }
       this.startHealth();
       await this.badge();
     } catch (error) {
@@ -173,20 +213,87 @@ export class Recorder {
       try { await this.api.debugger.detach({ tabId: previous.tabId }); }
       catch (error) { reason += ` Detach reported: ${String(error)}`; }
     }
-    await this.setNotice(reason, unexpected, { sessionId: previous.writer.metadata.id,
-      stopCode: code, detachReason, lastMessageAt: previous.writer.metadata.lastMessageAt });
+    const extra = { sessionId: previous.writer.metadata.id, stopCode: code, detachReason,
+      lastMessageAt: previous.writer.metadata.lastMessageAt };
+    await this.setNotice(`${reason} Saving JSON to Downloads…`, unexpected, extra);
+    // Not awaited: Stop returns immediately and the popup shows progress from status().
+    void this.archive(previous.writer.metadata.id, previous.writer, reason, unexpected, extra);
+    await this.badge();
+  }
+  // Writes the recording to Downloads, then clears it from the extension's storage.
+  async exportSession(sessionId) {
+    if (this.active?.writer.metadata.id === sessionId) throw new Error("Stop recording before exporting this session.");
+    const { url, filename, release } = await this.prepare(sessionId);
+    try {
+      const id = await this.api.downloads.download({ url, filename, conflictAction: "uniquify", saveAs: false });
+      await this.downloaded(id);
+    } finally { await release(); }
+    await this.remove(sessionId);
+    return filename;
+  }
+  downloaded(id) {
+    return new Promise((resolve, reject) => {
+      const done = finish => { this.api.downloads.onChanged.removeListener(listener); finish(); };
+      const settle = (state, error) => {
+        if (state === "complete") done(resolve);
+        else if (state === "interrupted") done(() => reject(new Error(`Download interrupted (${error || "unknown reason"}).`)));
+      };
+      const listener = delta => { if (delta.id === id) settle(delta.state?.current, delta.error?.current); };
+      this.api.downloads.onChanged.addListener(listener);
+      this.api.downloads.search({ id }).then(([item]) => settle(item?.state, item?.error), () => {});
+    });
+  }
+  async archive(sessionId, writer, reason, unexpected, extra) {
+    if (this.saving.has(sessionId)) return;
+    this.saving.add(sessionId);
+    let message;
+    try {
+      for (let waited = 0; writer && this.pending(writer) && waited < 15000; waited += 50) await this.wait(50);
+      message = `${reason} Saved ${await this.exportSession(sessionId)} to Downloads.`;
+    } catch (error) {
+      // Already exported and cleared by an earlier worker.
+      if (/not found/i.test(String(error))) message = reason;
+      else {
+        message = `${reason} Could not save the JSON file (${String(error)}). The recording is still kept; open Recordings to export it.`;
+        unexpected = true;
+      }
+    } finally { this.saving.delete(sessionId); }
+    // A newer recording's notice takes precedence.
+    if (!this.active && (!this.notice || this.notice.sessionId === sessionId)) await this.setNotice(message, unexpected, extra);
     await this.clearLedger();
     await this.badge();
   }
   handle(source, method, params) {
+    if (!this.initialized) {
+      // An event that wakes a stopped worker arrives before recovery finishes; replay it afterwards.
+      if (this.early.length < 10000) this.early.push([source, method, params]);
+      return;
+    }
     if (source.sessionId || !this.active || source.tabId !== this.active.tabId) return;
     const capture = this.active.capture;
     void capture.handle(method, params).catch(error => capture.diagnostic("gap", `Event processing failed: ${String(error)}`));
   }
   detached(source, reason) {
     if (source.tabId !== this.active?.tabId) return;
-    void this.stop(`Recording stopped: Chrome ended the debugger session (${reason}). Start on this tab again, then refresh; the missing interval cannot be recovered.`,
-      { detached: true, unexpected: true, code: "debugger_detached", detachReason: reason }).catch(error => this.report(error));
+    // Cancelling Chrome's debugging banner is a deliberate stop, not a failure.
+    const stopped = reason === "canceled_by_user"
+      ? this.stop("Recording stopped from Chrome's debugging banner.",
+        { detached: true, code: "banner_cancel", detachReason: reason })
+      : this.stop(`Recording stopped: Chrome ended the debugger session (${reason}). Start again to continue; traffic after this point is not captured.`,
+        { detached: true, unexpected: true, code: "debugger_detached", detachReason: reason });
+    void stopped.catch(error => this.report(error));
+  }
+  tabActivated({ tabId, windowId }) {
+    const current = this.active;
+    if (!current) return;
+    if (tabId === current.tabId) {
+      current.windowId = windowId;
+      if (current.visible === false) current.capture.diagnostic("tab", "Colonist tab is active again.");
+      current.visible = true;
+    } else if (windowId === current.windowId && current.visible !== false) {
+      current.visible = false;
+      current.capture.diagnostic("tab", "Switched to another tab; Colonist is in the background.");
+    }
   }
   changed(changes, area) {
     if (area !== "local" || !changes.recordingEnabled) return;
@@ -211,33 +318,48 @@ export class Recorder {
     this.probing = true;
     const current = this.active;
     try {
+      // Extension API calls reset the worker's idle timer.
+      await this.api.runtime?.getPlatformInfo?.().catch(() => {});
       const { frameTree: { frame } } = await this.api.debugger.sendCommand({ tabId: current.tabId }, "Page.getFrameTree");
       if (this.active !== current) return;
       if (!isColonistUrl(frame.url, ["https:"])) await this.stop("Tab left Colonist.", { code: "out_of_scope" });
       else current.writer.updateMetadata({ lastHealthAt: new Date().toISOString() });
     } catch (error) {
+      // A banner cancel can fail this probe just before Chrome's onDetach reports the real reason.
+      for (let waited = 0; this.active === current && waited < 1000; waited += 50) await this.wait(50);
       if (this.active === current) await this.stop(`Debugger connection check failed: ${String(error)}`, { unexpected: true, code: "connection_lost" });
     } finally { this.probing = false; }
   }
   status() {
     return { ok: true, activeTabId: this.active?.tabId ?? null, enabled: this.enabled, busy: this.busy,
+      recovering: !this.initialized, saving: this.saving.size > 0, eventCount: this.lastWriter?.sequence || 0,
       notice: this.notice?.message || "", noticeAt: this.notice?.at, interrupted: this.notice?.unexpected || false,
       lastMessageAt: this.lastWriter?.metadata.lastMessageAt || this.notice?.lastMessageAt,
       lastHealthAt: this.lastWriter?.metadata.lastHealthAt,
+      webSocketMessageCount: this.lastWriter?.metadata.webSocketMessageCount || 0,
+      game: gameStatus(this.lastWriter?.metadata.game), filtered: this.lastWriter?.metadata.filtered || {},
       ...(this.lastWriter?.status() || { sessionId: this.notice?.sessionId, queued: 0, pendingBodies: 0, dropped: 0 }) };
   }
   async request(message) {
+    // Status answers immediately so the popup never waits on worker recovery.
+    if (message.type === "recorder-status") return this.status();
     await this.ready;
-    if (message.type !== "recorder-status") {
-      if (this.busy) throw new Error("Recorder operation is already in progress.");
-      this.busy = true;
-      try {
-        if (message.type === "recorder-start") {
-          if (!Number.isInteger(message.tabId)) throw new Error("Invalid tab.");
-          await this.start(message.tabId);
-        } else await this.stop();
-      } finally { this.busy = false; }
+    if (message.type === "recorder-export") {
+      if (typeof message.sessionId !== "string") throw new Error("Invalid recording.");
+      if (this.saving.has(message.sessionId)) throw new Error("This recording is already being saved.");
+      if (this.lastWriter?.metadata.id === message.sessionId && this.pending()) throw new Error("Wait for pending events before exporting.");
+      this.saving.add(message.sessionId);
+      try { return { ...this.status(), filename: await this.exportSession(message.sessionId) }; }
+      finally { this.saving.delete(message.sessionId); }
     }
+    if (this.busy) throw new Error("Recorder operation is already in progress.");
+    this.busy = true;
+    try {
+      if (message.type === "recorder-start") {
+        if (!Number.isInteger(message.tabId)) throw new Error("Invalid tab.");
+        await this.start(message.tabId);
+      } else await this.stop();
+    } finally { this.busy = false; }
     return this.status();
   }
 }
